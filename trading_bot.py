@@ -7,28 +7,18 @@ import yfinance as yf
 from ta.momentum import RSIIndicator
 from ta.trend import SMAIndicator
 
-# Alpaca API imports (install with: pip install alpaca-py)
+# Alpaca API imports
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, GetAssetsRequest, GetOrderByIdRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, AssetClass, OrderStatus
+from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
 
-# --- Configuration (IMPORTANT: Use GitHub Secrets for these values!) ---
-# Alpaca API credentials
+# --- Configuration ---
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
-# Set to True for paper trading, False for live trading
-# Always start with paper trading!
 PAPER_TRADING_MODE = os.getenv("PAPER_TRADING_MODE", "True").lower() == "true"
-
-# Define the base URL for Alpaca (paper or live)
-# Paper Trading: https://paper-api.alpaca.markets
-# Live Trading: https://api.alpaca.markets
 ALPACA_BASE_URL = "https://paper-api.alpaca.markets" if PAPER_TRADING_MODE else "https://api.alpaca.markets"
-
-# Crypto API (CoinGecko Free API)
 COINGECKO_API_BASE_URL = "https://api.coingecko.com/api/v3"
 
-# List of symbols to scan
 SYMBOLS_TO_SCAN = {
     "AAPL": "stock",
     "MSFT": "stock",
@@ -37,13 +27,11 @@ SYMBOLS_TO_SCAN = {
     "ETHUSD": "crypto"
 }
 
-# Trading parameters
 TRADE_AMOUNT_PER_ASSET = 100
 MAX_POSITIONS = 5
 STOP_LOSS_PERCENT = 0.02
 TAKE_PROFIT_PERCENT = 0.03
 
-# Strategy parameters
 LOOKBACK_PERIOD_MINUTES = 60
 RSI_PERIOD = 14
 SMA_SHORT_PERIOD = 20
@@ -51,15 +39,13 @@ SMA_LONG_PERIOD = 200
 DIP_THRESHOLD_PERCENT = 0.015
 RSI_OVERSOLD = 30
 
-# File to store bot's managed positions
 POSITIONS_FILE = 'positions.json'
 
 
 # --- Initialization ---
 def initialize_alpaca_client():
-    """Initializes and returns the Alpaca TradingClient."""
     if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
-        print("Alpaca API keys not found. Please set them as GitHub Secrets.")
+        print("Alpaca API keys not found.")
         return None
     try:
         client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=PAPER_TRADING_MODE)
@@ -72,9 +58,8 @@ def initialize_alpaca_client():
 
 alpaca_client = initialize_alpaca_client()
 
-# --- Data Fetching Functions ---
+# --- Data Fetching ---
 def get_stock_data(symbol, interval='5m', lookback_minutes=LOOKBACK_PERIOD_MINUTES):
-    """Fetches historical stock data using yfinance."""
     try:
         data = yf.download(symbol, interval=interval, period="5d", progress=False)
         if data.empty:
@@ -89,17 +74,15 @@ def get_stock_data(symbol, interval='5m', lookback_minutes=LOOKBACK_PERIOD_MINUT
         print(f"Error fetching stock data for {symbol}: {e}")
         return None
 
-def get_crypto_data(symbol, lookback_minutes=LOOKBACK_PERIOD_MINUTES):
-    """Fetches crypto data using CoinGecko API."""
+def get_crypto_data(symbol):
     coingecko_id = ""
     if symbol == "BTCUSD":
         coingecko_id = "bitcoin"
     elif symbol == "ETHUSD":
         coingecko_id = "ethereum"
     else:
-        print(f"Unsupported crypto symbol for CoinGecko: {symbol}")
+        print(f"Unsupported crypto symbol: {symbol}")
         return None
-
     try:
         hourly_url = f"{COINGECKO_API_BASE_URL}/coins/{coingecko_id}/market_chart?vs_currency=usd&days=14"
         hourly_response = requests.get(hourly_url).json()
@@ -107,7 +90,7 @@ def get_crypto_data(symbol, lookback_minutes=LOOKBACK_PERIOD_MINUTES):
         timestamps = [p[0] for p in hourly_response.get('prices', [])]
 
         if not prices:
-            print(f"No historical crypto data fetched for {symbol}.")
+            print(f"No historical crypto data for {symbol}.")
             return None
 
         df = pd.DataFrame(prices, columns=['Close'])
@@ -125,26 +108,18 @@ def get_crypto_data(symbol, lookback_minutes=LOOKBACK_PERIOD_MINUTES):
         print(f"Error fetching crypto data for {symbol}: {e}")
         return None
 
-def get_latest_price_from_data(data):
-    """Extracts the latest price from the fetched data DataFrame."""
-    if data is None or data.empty:
-        return None
-    return data['Close'].iloc[-1]
-
-def calculate_technical_indicators_from_df(df):
-    """Calculates technical indicators from a DataFrame."""
+# --- Indicator Calculation ---
+def calculate_technical_indicators(df):
     if df is None or df.empty:
-        return None
+        return None, None, None
     
-    # Use squeeze() to ensure the 'Close' data is 1-dimensional
     close_prices = df['Close'].squeeze()
     
-    df['RSI'] = RSIIndicator(close=close_prices, window=RSI_PERIOD).rsi()
-    df[f'SMA_{SMA_SHORT_PERIOD}'] = SMAIndicator(close=close_prices, window=SMA_SHORT_PERIOD).sma_indicator()
-    df[f'SMA_{SMA_LONG_PERIOD}'] = SMAIndicator(close=close_prices, window=SMA_LONG_PERIOD).sma_indicator()
-    df['RecentHigh'] = df['High'].rolling(window=SMA_SHORT_PERIOD, min_periods=1).max()
+    rsi = RSIIndicator(close=close_prices, window=RSI_PERIOD).rsi().iloc[-1]
+    sma_long = SMAIndicator(close=close_prices, window=SMA_LONG_PERIOD).sma_indicator().iloc[-1]
+    recent_high = df['High'].rolling(window=SMA_SHORT_PERIOD, min_periods=1).max().iloc[-1]
     
-    return df.iloc[-1]
+    return rsi, sma_long, recent_high
 
 # --- State Management ---
 def load_bot_state():
@@ -160,9 +135,8 @@ def save_bot_state(state):
     with open(POSITIONS_FILE, 'w') as f:
         json.dump(state, f, indent=4)
 
-# --- Main Trading Logic ---
+# --- Main Logic ---
 def run_trading_strategy():
-    """Executes the trading strategy: scan, buy, and sell."""
     print(f"\n--- Starting scan at {pd.Timestamp.now(tz='UTC')} ---")
     bot_managed_positions = load_bot_state()
 
@@ -176,33 +150,18 @@ def run_trading_strategy():
             df_data = get_crypto_data(symbol)
 
         if df_data is None or df_data.empty:
-            print(f"Skipping {symbol}: No data available.")
+            print(f"Skipping {symbol}: No data.")
             continue
 
-        latest_price = get_latest_price_from_data(df_data)
-        if latest_price is None:
-            print(f"Skipping {symbol}: Could not get latest price.")
-            continue
+        latest_price = df_data['Close'].iloc[-1]
+        rsi, sma_long, recent_high = calculate_technical_indicators(df_data)
 
-        latest_indicators = calculate_technical_indicators_from_df(df_data)
-        if latest_indicators is None:
-            print(f"Skipping {symbol}: Could not calculate indicators.")
-            continue
-
-        # Extract scalar indicator values
-        rsi = latest_indicators['RSI']
-        sma_long = latest_indicators[f'SMA_{SMA_LONG_PERIOD}']
-        recent_high = latest_indicators['RecentHigh']
-
-        # --- This is the key fix ---
-        # Check if indicators are valid numbers before using them
         if pd.isna(rsi) or pd.isna(sma_long) or pd.isna(recent_high):
-            print(f"  Skipping {symbol}: Indicator values are not valid (NaN).")
+            print(f"  Skipping {symbol}: Not enough data for indicators.")
             continue
 
         print(f"  Price: {latest_price:.2f}, RSI: {rsi:.2f}, SMA_200: {sma_long:.2f}")
 
-        # Buy Logic
         if symbol not in bot_managed_positions:
             if len(bot_managed_positions) >= MAX_POSITIONS:
                 print("  Skipping BUY: Max positions reached.")
@@ -210,15 +169,13 @@ def run_trading_strategy():
 
             is_uptrend = latest_price > sma_long
             is_oversold = rsi <= RSI_OVERSOLD
-            price_drop = (recent_high - latest_price) / recent_high
-            is_dip = price_drop >= DIP_THRESHOLD_PERCENT
+            is_dip = (recent_high - latest_price) / recent_high >= DIP_THRESHOLD_PERCENT
             
             print(f"  Buy conditions: Uptrend={is_uptrend}, Oversold={is_oversold}, Dip={is_dip}")
 
             if is_uptrend and is_oversold and is_dip:
                 print(f"  SIGNAL: BUY {symbol}!")
-                # Here you would add your logic to place a buy order
-                # place_alpaca_order(...)
+                # Add order placement logic here
     
     save_bot_state(bot_managed_positions)
     print("\n--- Scan complete ---")
