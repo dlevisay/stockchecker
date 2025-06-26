@@ -1,0 +1,90 @@
+name: Stock/Crypto Trading Bot
+
+# This workflow runs on a schedule and can also be triggered manually.
+on:
+  schedule:
+    # Runs every 5 minutes.
+    # Note: GitHub Actions schedule events can be delayed during periods of high load.
+    # This is the minimum reliable frequency for scheduled events.
+    - cron: '*/5 * * * *'
+  # Allows you to manually run the workflow from the GitHub Actions tab
+  workflow_dispatch:
+
+jobs:
+  run-trading-bot:
+    # Use the latest Ubuntu runner for cost efficiency (1x minute multiplier, free for public repos)
+    runs-on: ubuntu-latest
+
+    # Define environment variables that can be overridden by secrets or default values
+    env:
+      PAPER_TRADING_MODE: true # Set to 'true' for paper trading (RECOMMENDED FOR TESTING!) or 'false' for live
+      ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+      ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+      # COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }} # Not needed for basic free CoinGecko usage
+
+    steps:
+      - name: Checkout repository
+        # This action checks out your repository code onto the runner.
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        # Configures the Python environment.
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9' # Use a specific, stable Python version
+
+      - name: Install dependencies
+        # Installs required Python packages using pip.
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas ta yfinance alpaca-py requests # Ensure all necessary libraries are listed
+
+      - name: Configure Git for Actions Bot
+        # Configure the Git user for committing changes back to the repository.
+        # This is essential for persisting the 'positions.json' file.
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Load previous bot state (positions.json)
+        # Attempt to fetch the 'positions.json' file from the 'main' branch.
+        # This ensures the bot's state is loaded from the most recent successful run.
+        # If the file doesn't exist (e.g., first run), it creates an empty one.
+        run: |
+          # Fetch the 'positions.json' from 'main' branch without changing current branch
+          git fetch origin main || echo "Main branch not found or fetch failed, assuming first run."
+          git checkout origin/main -- positions.json || echo "positions.json not found in main branch, creating new one."
+          # If positions.json does not exist locally after checkout, create an empty one
+          if [ ! -f positions.json ]; then
+            echo "{}" > positions.json
+            echo "Created empty positions.json for first run."
+          fi
+          echo "Current positions.json content:"
+          cat positions.json || echo "(empty)"
+
+      - name: Run Trading Bot
+        # Executes your Python trading script.
+        run: python trading_bot.py
+
+      - name: Commit updated positions
+        # Commits the 'positions.json' file back to the repository if it has changed.
+        # This step ensures the bot's state (open positions, stop/take-profit levels)
+        # is saved for the next scheduled run.
+        run: |
+          git add positions.json
+          # Check if there are any changes to commit
+          if git diff --cached --exit-code; then
+            echo "No changes to positions.json. Skipping commit."
+          else
+            git commit -m "Bot updated positions. [skip ci]" # [skip ci] prevents infinite workflow loops
+            git push origin HEAD:${GITHUB_REF##*/} # Push to the current branch
+            echo "Successfully committed and pushed updated positions.json."
+          fi
+        env:
+          # Use a PAT if the default GITHUB_TOKEN permissions are insufficient for pushing
+          # GITHUB_TOKEN usually has permissions to push to the same repo.
+          # If you encounter permission errors, create a PAT with 'repo' scope and use:
+          # GITHUB_TOKEN: ${{ secrets.YOUR_PAT_SECRET_NAME }}
+          # But try with default GITHUB_TOKEN first.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
