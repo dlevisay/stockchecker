@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 
 # Alpaca API imports
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, GetAssetsRequest
+from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, AssetClass, AssetStatus
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
@@ -64,11 +64,17 @@ def get_screened_symbols(trading_client, data_client):
     """Scans the market for high-quality, liquid stocks to trade."""
     logging.info("--- Starting Market Scan/Screening Process ---")
     
-    # 1. Get all US Equity assets from Alpaca
-    search_params = GetAssetsRequest(asset_class=AssetClass.US_EQUITY, status=AssetStatus.ACTIVE)
-    assets = trading_client.get_assets(search_params)
-    tradable_assets = [asset for asset in assets if asset.tradable and getattr(asset, 'easy_to_borrow', False)]
-    logging.info(f"Found {len(tradable_assets)} tradable US equity assets.")
+    try:
+        # 1. Get all US Equity assets from Alpaca using the correct method call
+        assets = trading_client.get_assets(status=AssetStatus.ACTIVE, asset_class=AssetClass.US_EQUITY)
+        
+        # Filter for assets that are tradable and easy to borrow (a good liquidity sign)
+        tradable_assets = [asset for asset in assets if asset.tradable and asset.easy_to_borrow]
+        logging.info(f"Found {len(tradable_assets)} tradable US equity assets.")
+
+    except Exception as e:
+        logging.error(f"Failed to get assets from Alpaca: {e}")
+        return []
 
     # 2. Filter assets based on liquidity and price
     qualified_symbols = []
@@ -82,13 +88,14 @@ def get_screened_symbols(trading_client, data_client):
             snapshots = data_client.get_stock_snapshots(symbols_chunk)
             
             for symbol, snapshot in snapshots.items():
-                if snapshot and snapshot.daily_bar and snapshot.latest_trade:
-                    avg_dollar_volume = snapshot.daily_bar.volume * snapshot.daily_bar.close
-                    if (avg_dollar_volume > MIN_AVG_DOLLAR_VOLUME and
+                if snapshot and snapshot.previous_daily_bar and snapshot.latest_trade:
+                    # Use previous day's bar for volume calculation to be conservative
+                    dollar_volume = snapshot.previous_daily_bar.volume * snapshot.previous_daily_bar.close
+                    if (dollar_volume > MIN_AVG_DOLLAR_VOLUME and
                         snapshot.latest_trade.price > MIN_SHARE_PRICE):
                         qualified_symbols.append({
                             "symbol": symbol,
-                            "dollar_volume": avg_dollar_volume
+                            "dollar_volume": dollar_volume
                         })
         except Exception as e:
             logging.warning(f"Could not process chunk {i // chunk_size + 1}: {e}")
@@ -136,7 +143,7 @@ def calculate_technical_indicators(df):
     gain = delta.where(delta > 0, 0)
     loss = -delta.where(delta < 0, 0)
     
-    # Use Exponential Moving Average for RSI calculation
+    # Use Exponential Moving Average for RSI calculation for accuracy
     avg_gain = gain.ewm(com=RSI_PERIOD - 1, min_periods=RSI_PERIOD).mean()
     avg_loss = loss.ewm(com=RSI_PERIOD - 1, min_periods=RSI_PERIOD).mean()
     
