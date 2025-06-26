@@ -1,32 +1,45 @@
-name: Run Trading Bot on a Schedule
+name: Scheduled Trading Bot
 
 on:
   schedule:
-    # This is a cron expression that runs the job every 6 minutes
-    - cron: '*/6 * * * *'
-  # This line allows you to also run the workflow manually from the Actions tab
-  workflow_dispatch:
+    # Runs every day at a specific time (adjust as needed)
+    - cron: '30 20 * * *' # Example: 8:30 PM UTC
+  workflow_dispatch: # Allows you to run it manually from the Actions tab
 
 jobs:
-  run-trading-bot:
+  trade:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v3
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
-          python-version: '3.9' # Or your preferred version
+          python-version: '3.9'
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas ta alpaca-py
+          pip install -r requirements.txt
+
+      # --- START: DEBUGGING STEPS ---
+      - name: List all files in the workspace
+        run: ls -R
+        # This will show us every single file and folder.
+
+      - name: Verify pip installation
+        run: pip show alpaca-py
+        # This will tell us exactly where the alpaca-py library was installed.
+
+      - name: Check Python's import paths
+        run: python -c "import sys; print(sys.path)"
+        # This shows us all the folders Python will look in.
+      # --- END: DEBUGGING STEPS ---
 
       - name: Run Trading Bot
         env:
+          PAPER_TRADING_MODE: true
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-          PAPER_TRADING_MODE: true
-        run: python trading_bot.py # The name of your python script file
+        run: python trading_bot.py
