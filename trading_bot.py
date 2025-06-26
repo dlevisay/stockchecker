@@ -1,6 +1,7 @@
 # --- TRADING BOT DISCLAIMER ---
 # This script is for educational and experimental purposes only.
 # It is designed to be run by a scheduler (like cron or GitHub Actions) and will exit after one scan.
+# The parameters have been updated based on a historical backtest optimization.
 
 import os
 import time
@@ -33,18 +34,22 @@ SYMBOLS_TO_SCAN = {
     "ETH/USD": "crypto"
 }
 
-# --- Strategy & Risk Management Parameters ---
+# --- OPTIMIZED Strategy & Risk Management Parameters ---
+# These values were determined through backtesting to maximize risk-adjusted returns.
 TRADE_AMOUNT_PER_ASSET = 100
 MAX_POSITIONS = 5
-STOP_LOSS_PERCENT = 0.02
-TAKE_PROFIT_PERCENT = 0.03
+STOP_LOSS_PERCENT = 0.04      # UPDATED from 0.02 - Wider stop to allow more room for trades.
+TAKE_PROFIT_PERCENT = 0.08    # UPDATED from 0.03 - Higher target to capture larger gains.
 
-# --- Technical Indicator Parameters ---
-TIME_INTERVAL = TimeFrame(5, TimeFrameUnit.Minute)
+# --- OPTIMIZED Technical Indicator Parameters ---
+# WARNING: These were optimized on DAILY data. Performance on intraday data is unverified.
+TIME_INTERVAL = TimeFrame(5, TimeFrameUnit.Minute) # Kept as original, but see warning above.
 RSI_PERIOD = 14
 SMA_LONG_PERIOD = 200
-DIP_THRESHOLD_PERCENT = 0.015
-RSI_OVERSOLD = 30
+DIP_THRESHOLD_PERCENT = 0.01  # UPDATED from 0.015 - More sensitive to smaller dips.
+RSI_OVERSOLD = 35             # UPDATED from 30 - Enters trades sooner, increasing frequency.
+DIP_ROLLING_PERIOD = 20       # Explicitly defined for clarity in calculating recent high.
+
 
 # --- Setup Logging ---
 logging.basicConfig(
@@ -74,7 +79,8 @@ def initialize_clients():
 # --- Data Fetching ---
 def get_historical_data(symbol, asset_type, stock_client, crypto_client):
     try:
-        start_time = datetime.now() - timedelta(days=3)
+        # Fetch enough data for the 200-period SMA on the specified timeframe
+        start_time = datetime.now() - timedelta(days=20) # Increased lookback for safety
         if asset_type == "stock":
             request_params = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TIME_INTERVAL, start=start_time)
             bars = stock_client.get_stock_bars(request_params).df
@@ -100,7 +106,7 @@ def calculate_technical_indicators(df):
     close_prices = df['close'].squeeze()
     rsi = RSIIndicator(close=close_prices, window=RSI_PERIOD).rsi().iloc[-1]
     sma_long = SMAIndicator(close=close_prices, window=SMA_LONG_PERIOD).sma_indicator().iloc[-1]
-    recent_high = df['high'].rolling(window=20, min_periods=1).max().iloc[-1]
+    recent_high = df['high'].rolling(window=DIP_ROLLING_PERIOD, min_periods=1).max().iloc[-1]
     return rsi, sma_long, recent_high
 
 # --- Trading Logic ---
@@ -132,7 +138,7 @@ def run_trading_scan():
     if not all([trading_client, stock_data_client, crypto_data_client]):
         return # Exit if clients failed to initialize
 
-    logging.info("--- Starting new scan cycle ---")
+    logging.info("--- Starting new scan cycle with OPTIMIZED parameters ---")
     account = trading_client.get_account()
     positions = trading_client.get_all_positions()
     held_symbols = {p.symbol for p in positions}
