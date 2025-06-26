@@ -28,9 +28,14 @@ MIN_SHARE_PRICE = 20.0
 MIN_AVG_DOLLAR_VOLUME = 20_000_000 # 20 Million
 
 MAX_POSITIONS = 5
-ACCOUNT_RISK_PERCENT = 0.01
-STOP_LOSS_PERCENT = 0.04
-TAKE_PROFIT_PERCENT = 0.08
+# MODIFIED: Risk management is now more nuanced
+ACCOUNT_RISK_PERCENT = 0.01 # The max % of total equity to risk on a single trade
+MAX_POSITION_SIZE_PERCENT = 0.10 # NEW: The max % of total equity to allocate to a single position (e.g., 0.10 for 10%)
+
+# MODIFIED: Removed static percentages, using ATR multiples instead
+ATR_PERIOD = 14
+ATR_STOP_MULTIPLE = 2.0 # e.g., Stop loss will be 2 * ATR below entry
+ATR_TAKE_PROFIT_MULTIPLE = 4.0 # e.g., Take profit will be 4 * ATR above entry
 
 TIME_INTERVAL = TimeFrame(1, TimeFrameUnit.Day)
 RSI_PERIOD = 14
@@ -38,6 +43,10 @@ SMA_LONG_PERIOD = 200
 DIP_THRESHOLD_PERCENT = 0.02
 RSI_OVERSOLD = 35
 DIP_ROLLING_PERIOD = 20
+
+# NEW: Parameters for the market-wide regime filter
+MARKET_INDEX_SYMBOL = 'SPY'
+MARKET_REGIME_SMA_PERIOD = 50 # Use the 50-day SMA for the market regime filter
 
 # --- Setup Logging ---
 logging.basicConfig(
@@ -65,11 +74,8 @@ def get_screened_symbols(trading_client, data_client):
     logging.info("--- Starting Market Scan/Screening Process ---")
     
     try:
-        # 1. Get all US Equity assets from Alpaca using the correct method call
         request_params = GetAssetsRequest(status=AssetStatus.ACTIVE, asset_class=AssetClass.US_EQUITY)
         assets = trading_client.get_all_assets(request_params)
-        
-        # Filter for assets that are tradable and easy to borrow (a good liquidity sign)
         tradable_assets = [asset for asset in assets if asset.tradable and getattr(asset, 'easy_to_borrow', False)]
         logging.info(f"Found {len(tradable_assets)} tradable US equity assets.")
 
@@ -77,21 +83,18 @@ def get_screened_symbols(trading_client, data_client):
         logging.error(f"Failed to get assets from Alpaca: {e}")
         return []
 
-    # 2. Filter assets based on liquidity and price
     qualified_symbols = []
-    chunk_size = 200 # Process symbols in chunks to avoid overwhelming the API
+    chunk_size = 200
     for i in range(0, len(tradable_assets), chunk_size):
         asset_chunk = tradable_assets[i:i + chunk_size]
         symbols_chunk = [asset.symbol for asset in asset_chunk]
         
         try:
-            # Fetch latest bars for volume and price data
             request_params = StockLatestBarRequest(symbol_or_symbols=symbols_chunk)
             latest_bars = data_client.get_stock_latest_bar(request_params)
             
             for symbol, bar in latest_bars.items():
                 if bar:
-                    # Use previous day's bar for volume calculation to be conservative
                     dollar_volume = bar.volume * bar.close
                     if (dollar_volume > MIN_AVG_DOLLAR_VOLUME and
                         bar.close > MIN_SHARE_PRICE):
@@ -101,11 +104,9 @@ def get_screened_symbols(trading_client, data_client):
                         })
         except Exception as e:
             logging.warning(f"Could not process chunk {i // chunk_size + 1}: {e}")
-        time.sleep(1) # Pause between chunks to respect rate limits
+        time.sleep(1) 
 
-    # 3. Sort by dollar volume and return the top symbols
     qualified_symbols.sort(key=lambda x: x['dollar_volume'], reverse=True)
-    
     final_symbols = [d['symbol'] for d in qualified_symbols[:MAX_SYMBOLS_TO_ANALYZE]]
     
     logging.info(f"Screening complete. Found {len(qualified_symbols)} qualified stocks.")
@@ -113,131 +114,189 @@ def get_screened_symbols(trading_client, data_client):
     
     return final_symbols
 
-def get_historical_data(symbol, data_client):
+def get_historical_data(symbol, data_client, days=365):
     """Fetches historical daily bar data for a given symbol."""
     try:
-        start_time = datetime.now() - timedelta(days=365) # Fetch enough data for 200-day SMA
+        start_time = datetime.now() - timedelta(days=days)
         request_params = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TIME_INTERVAL, start=start_time)
         bars = data_client.get_stock_bars(request_params).df
         if isinstance(bars.index, pd.MultiIndex):
             bars = bars.loc[symbol]
-        if bars.empty or len(bars) < SMA_LONG_PERIOD:
+        min_bars_needed = max(SMA_LONG_PERIOD, ATR_PERIOD, RSI_PERIOD)
+        if bars.empty or len(bars) < min_bars_needed:
             return None
         return bars
     except Exception as e:
         logging.error(f"Error fetching historical data for {symbol}: {e}")
         return None
 
+# MODIFIED: This function now also calculates and returns ATR
 def calculate_technical_indicators(df):
     """
-    Calculates technical indicators manually using pandas to avoid library conflicts.
+    Calculates technical indicators manually using pandas.
     """
-    if df is None or df.empty or len(df) < SMA_LONG_PERIOD:
-        return None, None, None
+    if df is None: return None, None, None, None
+    
+    max_period = max(SMA_LONG_PERIOD, RSI_PERIOD, ATR_PERIOD)
+    if len(df) < max_period: return None, None, None, None
 
     close_prices = df['close'].squeeze()
-
-    # --- Calculate SMA ---
+    
     sma_long = close_prices.rolling(window=SMA_LONG_PERIOD).mean().iloc[-1]
-
-    # --- Calculate RSI ---
+    
     delta = close_prices.diff()
     gain = delta.where(delta > 0, 0)
     loss = -delta.where(delta < 0, 0)
-    
-    # Use Exponential Moving Average for RSI calculation for accuracy
     avg_gain = gain.ewm(com=RSI_PERIOD - 1, min_periods=RSI_PERIOD).mean()
     avg_loss = loss.ewm(com=RSI_PERIOD - 1, min_periods=RSI_PERIOD).mean()
-    
     rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs)).iloc[-1]
 
-    # --- Calculate Recent High ---
     recent_high = df['high'].rolling(window=DIP_ROLLING_PERIOD, min_periods=1).max().iloc[-1]
 
-    return rsi, sma_long, recent_high
+    # NEW: Calculate ATR (Average True Range)
+    high_low = df['high'] - df['low']
+    high_close = (df['high'] - df['close'].shift()).abs()
+    low_close = (df['low'] - df['close'].shift()).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1/ATR_PERIOD, adjust=False).mean().iloc[-1]
 
-def execute_bracket_order(symbol, trade_amount, trading_client, data_client):
-    """Submits a bracket order with a notional trade amount."""
+    return rsi, sma_long, recent_high, atr
+
+# MODIFIED: Signature changed to accept pre-calculated stop/take profit prices
+def execute_bracket_order(symbol, trade_amount, take_profit_price, stop_loss_price, trading_client):
+    """Submits a bracket order with a notional trade amount and precise exit prices."""
     try:
-        latest_trade = data_client.get_stock_latest_trade(symbol)
-        latest_price = latest_trade.price
         market_order_data = MarketOrderRequest(
             symbol=symbol,
             notional=trade_amount,
             side=OrderSide.BUY,
             time_in_force=TimeInForce.GTC,
             order_class=OrderClass.BRACKET,
-            take_profit={'limit_price': round(latest_price * (1 + TAKE_PROFIT_PERCENT), 2)},
-            stop_loss={'stop_price': round(latest_price * (1 - STOP_LOSS_PERCENT), 2)}
+            take_profit={'limit_price': round(take_profit_price, 2)},
+            stop_loss={'stop_price': round(stop_loss_price, 2)}
         )
         order = trading_client.submit_order(order_data=market_order_data)
         logging.info(f"SUCCESS: Submitted bracket order for {symbol} for ${trade_amount:,.2f}. Order ID: {order.id}")
+        logging.info(f"  -> TP: ${take_profit_price:,.2f}, SL: ${stop_loss_price:,.2f}")
     except Exception as e:
         logging.error(f"Failed to submit bracket order for {symbol}: {e}")
 
-# --- Main Bot Function ---
+# MODIFIED: Entire main function refactored for new logic
 def run_trading_scan():
-    """Main function to screen the market and run a single daily trading scan."""
+    """Main function to screen, rank, and trade based on the enhanced strategy."""
     trading_client, data_client = initialize_clients()
-    if not all([trading_client, data_client]):
-        return # Exit if clients failed to initialize
+    if not all([trading_client, data_client]): return
 
-    # --- DYNAMICALLY GET SYMBOLS TO SCAN ---
+    # --- 1. NEW: Market Regime Filter ---
+    logging.info(f"--- Checking Market-Wide Regime via {MARKET_INDEX_SYMBOL} ---")
+    spy_data = get_historical_data(MARKET_INDEX_SYMBOL, data_client, days=100)
+    if spy_data is None:
+        logging.error(f"Could not fetch data for market index {MARKET_INDEX_SYMBOL}. Aborting scan.")
+        return
+    
+    spy_sma = spy_data['close'].rolling(window=MARKET_REGIME_SMA_PERIOD).mean().iloc[-1]
+    spy_latest_price = spy_data['close'].iloc[-1]
+    
+    if spy_latest_price < spy_sma:
+        logging.warning(f"MARKET REGIME IS 'RISK-OFF': {MARKET_INDEX_SYMBOL} price (${spy_latest_price:,.2f}) is below its {MARKET_REGIME_SMA_PERIOD}-day SMA (${spy_sma:,.2f}). No new long trades will be placed.")
+        return
+    else:
+        logging.info(f"MARKET REGIME IS 'RISK-ON': {MARKET_INDEX_SYMBOL} is trading above its {MARKET_REGIME_SMA_PERIOD}-day SMA.")
+
+    # --- 2. Get Account Status and Screen for Symbols ---
+    account = trading_client.get_account()
+    positions = trading_client.get_all_positions()
+    held_symbols = {p.symbol for p in positions}
+    account_equity = float(account.equity)
+    
+    logging.info(f"Account Equity: ${account_equity:,.2f}.")
+    logging.info(f"Currently holding {len(held_symbols)} positions: {list(held_symbols)}")
+    
+    if len(held_symbols) >= MAX_POSITIONS:
+        logging.warning(f"Max positions ({MAX_POSITIONS}) reached. Exiting scan.")
+        return
+
     symbols_to_scan = get_screened_symbols(trading_client, data_client)
     if not symbols_to_scan:
         logging.warning("Screener returned no symbols. Exiting scan.")
         return
 
+    # --- 3. NEW: Analyze All Symbols and Collect Valid Signals ---
     logging.info("--- Starting Technical Analysis on Screened Stocks ---")
-    account = trading_client.get_account()
-    positions = trading_client.get_all_positions()
-    held_symbols = {p.symbol for p in positions}
-    account_equity = float(account.equity)
-
-    logging.info(f"Account Equity: ${account_equity:,.2f}.")
-    logging.info(f"Currently holding {len(held_symbols)} positions: {list(held_symbols)}")
-
-    if len(held_symbols) >= MAX_POSITIONS:
-        logging.warning(f"Max positions ({MAX_POSITIONS}) reached. Exiting scan.")
-        return
-
-    # --- DYNAMIC RISK MANAGEMENT ---
-    max_risk_per_trade = account_equity * ACCOUNT_RISK_PERCENT
-    trade_amount_per_asset = max_risk_per_trade / STOP_LOSS_PERCENT
-    logging.info(f"Risk config: Max risk/trade: ${max_risk_per_trade:,.2f}. Position Size: ${trade_amount_per_asset:,.2f}")
-
-    if float(account.buying_power) < trade_amount_per_asset:
-        logging.warning(f"Insufficient buying power for new trade. Exiting.")
-        return
-
+    buy_signals = []
     for symbol in symbols_to_scan:
-        if symbol in held_symbols:
-            continue
+        if symbol in held_symbols: continue
         
         logging.info(f"Processing {symbol}...")
         df_data = get_historical_data(symbol, data_client)
         if df_data is None: continue
 
-        latest_price = df_data['close'].iloc[-1]
-        rsi, sma_long, recent_high = calculate_technical_indicators(df_data)
-        if any(pd.isna(x) for x in [rsi, sma_long, recent_high]):
+        rsi, sma_long, recent_high, atr = calculate_technical_indicators(df_data)
+        if any(pd.isna(x) for x in [rsi, sma_long, recent_high, atr]):
             logging.warning(f"Could not calculate all indicators for {symbol}. Skipping.")
             continue
         
-        logging.info(f"  -> Price: ${latest_price:,.2f}, RSI: {rsi:.2f}, SMA_200: ${sma_long:,.2f}")
+        latest_price = df_data['close'].iloc[-1]
+        logging.info(f"  -> Price: ${latest_price:,.2f}, RSI: {rsi:.2f}, ATR: {atr:.2f}, SMA_200: ${sma_long:,.2f}")
         
         is_uptrend = latest_price > sma_long
         is_oversold = rsi <= RSI_OVERSOLD
         is_dip = (recent_high - latest_price) / recent_high >= DIP_THRESHOLD_PERCENT
         
-        logging.info(f"  -> Buy conditions: Uptrend={is_uptrend}, Oversold={is_oversold}, Dip={is_dip}")
-
         if is_uptrend and is_oversold and is_dip:
-            logging.info(f"**** BUY SIGNAL DETECTED FOR {symbol} ****")
-            execute_bracket_order(symbol, trade_amount_per_asset, trading_client, data_client)
-            logging.info("Trade placed. Ending this scan cycle.")
-            return # Exit after placing one trade to prevent rapid-fire orders
+            buy_signals.append({
+                "symbol": symbol,
+                "price": latest_price,
+                "rsi": rsi,
+                "atr": atr
+            })
+            logging.info(f"  -> VALID BUY SIGNAL FOUND for {symbol}. Added to candidate list.")
+            
+    # --- 4. NEW: Rank Signals and Select the Best One ---
+    if not buy_signals:
+        logging.info("--- Scan complete. No valid buy signals found today. ---")
+        return
+        
+    # Rank by the lowest RSI to find the most 'oversold' candidate
+    buy_signals.sort(key=lambda x: x['rsi'])
+    best_signal = buy_signals[0]
+    
+    logging.info(f"--- Found {len(buy_signals)} signal(s). Best candidate is {best_signal['symbol']} with RSI {best_signal['rsi']:.2f} ---")
+
+    # --- 5. NEW: Refined Position Sizing ---
+    symbol_to_buy = best_signal['symbol']
+    latest_price = best_signal['price']
+    atr = best_signal['atr']
+    
+    stop_loss_per_share = atr * ATR_STOP_MULTIPLE
+    
+    # 1. Calculate size based on account risk %
+    max_risk_per_trade_dollar = account_equity * ACCOUNT_RISK_PERCENT
+    risk_based_notional_size = (max_risk_per_trade_dollar / stop_loss_per_share) * latest_price
+    
+    # 2. Calculate size based on max allocation cap %
+    max_notional_by_cap = account_equity * MAX_POSITION_SIZE_PERCENT
+    
+    # 3. Final position size is the smaller of the two calculations
+    final_trade_amount = min(risk_based_notional_size, max_notional_by_cap)
+    
+    logging.info(f"--- Dynamic Position Sizing for {symbol_to_buy} ---")
+    logging.info(f"  -> Max Risk per Trade: ${max_risk_per_trade_dollar:,.2f}")
+    logging.info(f"  -> Risk-Based Size: ${risk_based_notional_size:,.2f}")
+    logging.info(f"  -> Max Allocation Cap Size: ${max_notional_by_cap:,.2f}")
+    logging.info(f"  -> FINAL POSITION SIZE: ${final_trade_amount:,.2f}")
+
+    if float(account.buying_power) < final_trade_amount:
+        logging.warning(f"Insufficient buying power (${float(account.buying_power):,.2f}) for new trade of ${final_trade_amount:,.2f}. Exiting.")
+        return
+        
+    # --- 6. Execute Trade with ATR-based Exits ---
+    stop_loss_price = latest_price - (atr * ATR_STOP_MULTIPLE)
+    take_profit_price = latest_price + (atr * ATR_TAKE_PROFIT_MULTIPLE)
+    
+    logging.info(f"**** PLACING TRADE FOR {symbol_to_buy} ****")
+    execute_bracket_order(symbol_to_buy, final_trade_amount, take_profit_price, stop_loss_price, trading_client)
             
     logging.info("--- Scan complete ---")
 
