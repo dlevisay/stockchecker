@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 
 # Alpaca API imports
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.requests import MarketOrderRequest, GetAssetsRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, AssetClass, AssetStatus
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
@@ -66,10 +66,11 @@ def get_screened_symbols(trading_client, data_client):
     
     try:
         # 1. Get all US Equity assets from Alpaca using the correct method call
-        assets = trading_client.get_assets(status=AssetStatus.ACTIVE, asset_class=AssetClass.US_EQUITY)
+        request_params = GetAssetsRequest(status=AssetStatus.ACTIVE, asset_class=AssetClass.US_EQUITY)
+        assets = trading_client.get_all_assets(request_params)
         
         # Filter for assets that are tradable and easy to borrow (a good liquidity sign)
-        tradable_assets = [asset for asset in assets if asset.tradable and asset.easy_to_borrow]
+        tradable_assets = [asset for asset in assets if asset.tradable and getattr(asset, 'easy_to_borrow', False)]
         logging.info(f"Found {len(tradable_assets)} tradable US equity assets.")
 
     except Exception as e:
@@ -158,7 +159,8 @@ def calculate_technical_indicators(df):
 def execute_bracket_order(symbol, trade_amount, trading_client):
     """Submits a bracket order with a notional trade amount."""
     try:
-        latest_price = trading_client.get_latest_trade(symbol).price
+        latest_trade = data_client.get_stock_latest_trade(symbol)
+        latest_price = latest_trade.price
         market_order_data = MarketOrderRequest(
             symbol=symbol,
             notional=trade_amount,
