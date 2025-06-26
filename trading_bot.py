@@ -1,6 +1,6 @@
 # --- TRADING BOT DISCLAIMER ---
 # This script is for educational and experimental purposes only.
-# It now includes a dynamic screener to find new trading opportunities daily.
+# It includes a dynamic screener and manual indicator calculations.
 # It is designed to be run once per day after market close.
 
 import os
@@ -8,10 +8,6 @@ import time
 import pandas as pd
 import logging
 from datetime import datetime, timedelta
-
-# Technical Analysis library
-from ta.momentum import RSIIndicator
-from ta.trend import SMAIndicator
 
 # Alpaca API imports
 from alpaca.trading.client import TradingClient
@@ -27,7 +23,7 @@ ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 PAPER_TRADING_MODE = os.getenv("PAPER_TRADING_MODE", "True").lower() == "true"
 
-# --- REVISED Screener & Strategy Parameters ---
+# --- Screener & Strategy Parameters ---
 MAX_SYMBOLS_TO_ANALYZE = 100 # Analyze the top 100 most liquid stocks that pass the screener
 MIN_SHARE_PRICE = 20.0
 MIN_AVG_DOLLAR_VOLUME = 20_000_000 # 20 Million
@@ -52,7 +48,7 @@ logging.basicConfig(
 )
 
 def initialize_clients():
-    # Initializes and returns the trading and data clients
+    """Initializes and returns the trading and data clients."""
     if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
         logging.error("CRITICAL: Alpaca API keys not found.")
         return None, None
@@ -65,17 +61,14 @@ def initialize_clients():
         logging.error(f"Error initializing Alpaca clients: {e}")
         return None, None
 
-# --- NEW SCREENER FUNCTION ---
 def get_screened_symbols(trading_client, data_client):
-    """
-    Scans the market for high-quality, liquid stocks to trade.
-    """
+    """Scans the market for high-quality, liquid stocks to trade."""
     logging.info("--- Starting Market Scan/Screening Process ---")
     
     # 1. Get all US Equity assets from Alpaca
     search_params = GetAssetsRequest(asset_class=AssetClass.US_EQUITY, status=AssetStatus.ACTIVE)
     assets = trading_client.get_assets(search_params)
-    tradable_assets = [asset for asset in assets if asset.tradable and asset.shortable and asset.easy_to_borrow]
+    tradable_assets = [asset for asset in assets if asset.tradable and getattr(asset, 'easy_to_borrow', False)]
     logging.info(f"Found {len(tradable_assets)} tradable US equity assets.")
 
     # 2. Filter assets based on liquidity and price
@@ -112,9 +105,8 @@ def get_screened_symbols(trading_client, data_client):
     
     return final_symbols
 
-# --- The rest of the functions (calculate_technical_indicators, etc.) remain the same ---
-# ... (insert the unchanged functions from the previous version here) ...
 def get_historical_data(symbol, data_client):
+    """Fetches historical daily bar data for a given symbol."""
     try:
         start_time = datetime.now() - timedelta(days=365) # Fetch enough data for 200-day SMA
         request_params = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TIME_INTERVAL, start=start_time)
@@ -129,14 +121,36 @@ def get_historical_data(symbol, data_client):
         return None
 
 def calculate_technical_indicators(df):
-    if df is None or df.empty: return None, None, None
+    """
+    Calculates technical indicators manually using pandas to avoid library conflicts.
+    """
+    if df is None or df.empty or len(df) < SMA_LONG_PERIOD:
+        return None, None, None
+
     close_prices = df['close'].squeeze()
-    rsi = RSIIndicator(close=close_prices, window=RSI_PERIOD).rsi().iloc[-1]
-    sma_long = SMAIndicator(close=close_prices, window=SMA_LONG_PERIOD).sma_indicator().iloc[-1]
+
+    # --- Calculate SMA ---
+    sma_long = close_prices.rolling(window=SMA_LONG_PERIOD).mean().iloc[-1]
+
+    # --- Calculate RSI ---
+    delta = close_prices.diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    
+    # Use Exponential Moving Average for RSI calculation
+    avg_gain = gain.ewm(com=RSI_PERIOD - 1, min_periods=RSI_PERIOD).mean()
+    avg_loss = loss.ewm(com=RSI_PERIOD - 1, min_periods=RSI_PERIOD).mean()
+    
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs)).iloc[-1]
+
+    # --- Calculate Recent High ---
     recent_high = df['high'].rolling(window=DIP_ROLLING_PERIOD, min_periods=1).max().iloc[-1]
+
     return rsi, sma_long, recent_high
 
 def execute_bracket_order(symbol, trade_amount, trading_client):
+    """Submits a bracket order with a notional trade amount."""
     try:
         latest_price = trading_client.get_latest_trade(symbol).price
         market_order_data = MarketOrderRequest(
@@ -214,7 +228,7 @@ def run_trading_scan():
             logging.info(f"**** BUY SIGNAL DETECTED FOR {symbol} ****")
             execute_bracket_order(symbol, trade_amount_per_asset, trading_client)
             logging.info("Trade placed. Ending this scan cycle.")
-            return # Use return to exit after one trade, break would just exit the loop
+            return # Exit after placing one trade to prevent rapid-fire orders
             
     logging.info("--- Scan complete ---")
 
