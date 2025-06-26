@@ -14,7 +14,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, GetAssetsRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, AssetClass, AssetStatus
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
+from alpaca.data.requests import StockBarsRequest, StockLatestBarRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 # --- Configuration ---
@@ -85,15 +85,16 @@ def get_screened_symbols(trading_client, data_client):
         symbols_chunk = [asset.symbol for asset in asset_chunk]
         
         try:
-            # Fetch snapshots for volume and price data
-            snapshots = data_client.get_stock_snapshots(symbols_chunk)
+            # Fetch latest bars for volume and price data
+            request_params = StockLatestBarRequest(symbol_or_symbols=symbols_chunk)
+            latest_bars = data_client.get_stock_latest_bar(request_params)
             
-            for symbol, snapshot in snapshots.items():
-                if snapshot and snapshot.previous_daily_bar and snapshot.latest_trade:
+            for symbol, bar in latest_bars.items():
+                if bar:
                     # Use previous day's bar for volume calculation to be conservative
-                    dollar_volume = snapshot.previous_daily_bar.volume * snapshot.previous_daily_bar.close
+                    dollar_volume = bar.volume * bar.close
                     if (dollar_volume > MIN_AVG_DOLLAR_VOLUME and
-                        snapshot.latest_trade.price > MIN_SHARE_PRICE):
+                        bar.close > MIN_SHARE_PRICE):
                         qualified_symbols.append({
                             "symbol": symbol,
                             "dollar_volume": dollar_volume
@@ -156,7 +157,7 @@ def calculate_technical_indicators(df):
 
     return rsi, sma_long, recent_high
 
-def execute_bracket_order(symbol, trade_amount, trading_client):
+def execute_bracket_order(symbol, trade_amount, trading_client, data_client):
     """Submits a bracket order with a notional trade amount."""
     try:
         latest_trade = data_client.get_stock_latest_trade(symbol)
@@ -234,7 +235,7 @@ def run_trading_scan():
 
         if is_uptrend and is_oversold and is_dip:
             logging.info(f"**** BUY SIGNAL DETECTED FOR {symbol} ****")
-            execute_bracket_order(symbol, trade_amount_per_asset, trading_client)
+            execute_bracket_order(symbol, trade_amount_per_asset, trading_client, data_client)
             logging.info("Trade placed. Ending this scan cycle.")
             return # Exit after placing one trade to prevent rapid-fire orders
             
