@@ -22,7 +22,7 @@ from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 from alpaca.data.historical import CryptoHistoricalDataClient, StockHistoricalDataClient
 from alpaca.data.requests import CryptoBarsRequest, StockBarsRequest
-from alpaca.data.timeframe import TimeFrame, TimeFrameUnit # Corrected: Added TimeFrameUnit
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 # --- Configuration ---
 # Fetch API keys from environment variables for security
@@ -49,7 +49,6 @@ TAKE_PROFIT_PERCENT = 0.03    # 3% take profit from entry price
 SCAN_INTERVAL_SECONDS = 300   # How often to scan the market (300s = 5 minutes)
 
 # --- Technical Indicator Parameters ---
-# Corrected: Use the TimeFrame constructor for specific intervals
 TIME_INTERVAL = TimeFrame(5, TimeFrameUnit.Minute)
 RSI_PERIOD = 14
 SMA_LONG_PERIOD = 200
@@ -219,7 +218,8 @@ def run_trading_bot():
                 logging.info(f"  -> Price: ${latest_price:,.2f}, RSI: {rsi:.2f}, SMA_200: ${sma_long:,.2f}, Recent High: ${recent_high:,.2f}")
 
                 # --- The Buy Strategy Logic ---
-                is_uptrend = latest__price > sma_long
+                # *** CORRECTED TYPO HERE ***
+                is_uptrend = latest_price > sma_long 
                 is_oversold = rsi <= RSI_OVERSOLD
                 is_dip = (recent_high - latest_price) / recent_high >= DIP_THRESHOLD_PERCENT
                 
