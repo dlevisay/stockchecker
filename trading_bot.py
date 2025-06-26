@@ -82,32 +82,29 @@ alpaca_client = initialize_alpaca_client()
 def get_stock_data(symbol, interval='5m', lookback_minutes=LOOKBACK_PERIOD_MINUTES):
     """Fetches historical stock data using yfinance."""
     try:
-        # yfinance interval '5m' for 5-minute bars
-        # yfinance period is approximate, calculate based on lookback_minutes
-        period_str = f"{lookback_minutes + 10}m" # Fetch slightly more to ensure enough data
-        data = yf.download(symbol, interval=interval, period=period_str, progress=False)
+        # yfinance interval '5m' for 5-minute bars.
+        # The 'period' parameter for yfinance must be a string like '1d', '5d', '1mo', etc.
+        # We'll fetch a few days of data to ensure we have enough for our indicators.
+        # A 5-day period should be sufficient for 5-minute interval data.
+        data = yf.download(symbol, interval=interval, period="5d", progress=False)
         if data.empty:
             print(f"No stock data fetched for {symbol}.")
             return None
         # Ensure we have at least enough data for the longest SMA
         if len(data) < SMA_LONG_PERIOD:
             print(f"Not enough historical data for {symbol} to calculate {SMA_LONG_PERIOD}-period SMA. Need at least {SMA_LONG_PERIOD} bars, got {len(data)}.")
-            return None
-        return data
+            # Depending on the strategy, you might want to return None or handle this differently.
+            # For now, we will proceed, and the SMA calculation will result in NaN, which is handled later.
+
+        # Calculate the number of bars needed based on the lookback period in minutes
+        bars_needed = lookback_minutes // int(interval.replace('m', ''))
+        return data.tail(bars_needed) # Return the most recent 'n' bars
     except Exception as e:
         print(f"Error fetching stock data for {symbol}: {e}")
         return None
 
 def get_crypto_data(symbol, interval='5m', lookback_minutes=LOOKBACK_PERIOD_MINUTES):
     """Fetches crypto data using CoinGecko API."""
-    # CoinGecko API uses different symbols (e.g., 'bitcoin' for BTCUSD)
-    # And supports different intervals. '5m' is tricky, often use 'hourly' or 'daily'
-    # For sub-hourly, you might need to fetch 1-min data and resample, or use a paid API.
-    # For simplicity, we'll fetch daily for longer history and assume 5-min current price.
-    # Note: CoinGecko's /market_chart endpoint is for candles, not real-time specific price.
-    # For real-time, it's often a websocket or a dedicated "ticker" endpoint.
-    # Here, we'll use a simplified approach for 'current_price' for demonstration.
-
     coingecko_id = ""
     if symbol == "BTCUSD":
         coingecko_id = "bitcoin"
@@ -119,8 +116,6 @@ def get_crypto_data(symbol, interval='5m', lookback_minutes=LOOKBACK_PERIOD_MINU
 
     try:
         # Fetch historical hourly data (closest to 5-min for indicator calculation)
-        # For actual 5-min indicators, you would need a more granular API.
-        # This is a simplification for a free API.
         hourly_url = f"{COINGECKO_API_BASE_URL}/coins/{coingecko_id}/market_chart?vs_currency=usd&days=7" # Fetch 7 days of hourly data
         hourly_response = requests.get(hourly_url).json()
         prices = [p[1] for p in hourly_response.get('prices', [])]
@@ -143,25 +138,17 @@ def get_crypto_data(symbol, interval='5m', lookback_minutes=LOOKBACK_PERIOD_MINU
         df['Open'] = df['High'] = df['Low'] = df['Close'] # Simplistic for indicator calc
         df['Volume'] = 0 # Dummy volume
 
-        # To ensure enough data for SMA_LONG_PERIOD, we might need more than 7 days
-        # For a truly robust bot, use a dedicated crypto data API that offers proper candle data (e.g., Kraken, Binance APIs)
         if len(df) < SMA_LONG_PERIOD:
              print(f"Warning: Not enough historical data for {symbol} to calculate {SMA_LONG_PERIOD}-period SMA for crypto. Need at least {SMA_LONG_PERIOD} bars, got {len(df)}. Strategy may be impaired.")
 
-
-        # Get the very latest price if available from another endpoint or from the last data point
         if latest_price:
-            # Append current price to the DataFrame for the most up-to-date indicators
-            # This is a bit of a hack as CoinGecko's historical data isn't real-time 5-min
-            # A real solution would use a dedicated WebSocket or 1-min API for live price.
             current_time = pd.Timestamp.now(tz='UTC')
             new_row = pd.DataFrame([{'Open': latest_price, 'High': latest_price, 'Low': latest_price, 'Close': latest_price, 'Volume': 0}], index=[current_time])
             new_row.index.name = 'Datetime'
-            df = pd.concat([df, new_row]).tail(lookback_minutes) # Keep only the last N
+            df = pd.concat([df, new_row]).tail(lookback_minutes)
         else:
             latest_price = df['Close'].iloc[-1] # Fallback to last historical close
 
-        # Attach latest price to the DataFrame as a new column or attribute for easy access
         df['latest_price'] = latest_price
         return df
 
@@ -177,7 +164,7 @@ def get_latest_price_from_data(data, asset_type):
     if asset_type == "stock":
         return data['Close'].iloc[-1]
     elif asset_type == "crypto":
-        return data['latest_price'].iloc[-1] # From our custom 'latest_price' field
+        return data['latest_price'].iloc[-1]
     return None
 
 def calculate_technical_indicators_from_df(df):
@@ -231,25 +218,18 @@ def place_alpaca_order(client, symbol, qty, side):
         print("Alpaca client not initialized, cannot place order.")
         return False
     try:
-        # Ensure quantity is valid (Alpaca requires non-zero)
         if qty <= 0:
             print(f"Invalid quantity {qty} for order on {symbol}. Skipping.")
             return False
 
-        # Alpaca crypto trading requires specific symbols (e.g., BTC/USD or BTCUSD)
-        # Ensure symbol matches Alpaca's format. For stocks, usually just the ticker.
-        # For crypto, often needs to be `BTCUSD` rather than `bitcoin`.
-        # We already defined SYMBOLS_TO_SCAN to match Alpaca's crypto naming.
-
         order_data = MarketOrderRequest(
             symbol=symbol,
-            qty=qty, # Use qty directly
+            qty=qty,
             side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
-            time_in_force=TimeInForce.GTC # Good 'Til Cancelled (for stop/limit orders later)
+            time_in_force=TimeInForce.GTC
         )
         order = client.submit_order(order_data)
         print(f"Alpaca Order submitted for {symbol}: ID {order.id}, Status: {order.status}, Side: {order.side}, Qty: {order.qty}")
-        # Consider waiting for order to be filled for more accurate tracking
         return True
     except Exception as e:
         print(f"Error placing Alpaca order for {symbol} ({side} {qty}): {e}")
@@ -285,12 +265,9 @@ def run_trading_strategy():
     """Executes the trading strategy: scan, buy, and sell."""
     print(f"\n--- Starting 5-minute scan at {pd.Timestamp.now()} (UTC) ---")
 
-    bot_managed_positions = load_bot_state() # Positions the bot has bought and is tracking
-    alpaca_actual_positions = get_alpaca_positions(alpaca_client) # Actual positions on Alpaca
+    bot_managed_positions = load_bot_state()
+    alpaca_actual_positions = get_alpaca_positions(alpaca_client)
 
-    # Synchronize bot_managed_positions with actual Alpaca positions
-    # If bot thinks it holds something, but Alpaca doesn't, remove it from bot_managed_positions.
-    # This handles manual sales or external factors.
     symbols_to_remove = []
     for symbol in bot_managed_positions.keys():
         if symbol not in alpaca_actual_positions:
@@ -298,13 +275,11 @@ def run_trading_strategy():
             symbols_to_remove.append(symbol)
     for symbol in symbols_to_remove:
         del bot_managed_positions[symbol]
-    save_bot_state(bot_managed_positions) # Save updated state
+    save_bot_state(bot_managed_positions)
 
-    # Iterate through each symbol to scan
     for symbol, asset_type in SYMBOLS_TO_SCAN.items():
         print(f"\nProcessing {symbol} ({asset_type})...")
 
-        # 1. Fetch data
         df_data = None
         if asset_type == "stock":
             df_data = get_stock_data(symbol)
@@ -320,7 +295,6 @@ def run_trading_strategy():
             print(f"Skipping {symbol}: Could not get latest price from data.")
             continue
 
-        # 2. Calculate indicators
         latest_indicators = calculate_technical_indicators_from_df(df_data)
         if latest_indicators is None:
             print(f"Skipping {symbol}: Could not calculate indicators.")
@@ -333,7 +307,6 @@ def run_trading_strategy():
 
         print(f"  Current Price: {latest_price:.4f}, RSI: {rsi:.2f}, SMA_{SMA_SHORT_PERIOD}: {sma_short:.4f}, SMA_{SMA_LONG_PERIOD}: {sma_long:.4f}, Recent High ({SMA_SHORT_PERIOD} bars): {recent_high:.4f}")
 
-        # 3. Sell Logic (if we currently hold this asset)
         if symbol in bot_managed_positions:
             pos_data = bot_managed_positions[symbol]
             entry_price = pos_data['entry_price']
@@ -343,38 +316,30 @@ def run_trading_strategy():
 
             print(f"  Position for {symbol}: Qty={qty}, Entry={entry_price:.4f}, Target={target_sell_price:.4f}, StopLoss={stop_loss_price:.4f}")
 
-            # Check for Take Profit
             if latest_price >= target_sell_price:
                 print(f"  SIGNAL: SELL {symbol} - Take Profit reached!")
                 if place_alpaca_order(alpaca_client, symbol, qty, "sell"):
                     del bot_managed_positions[symbol]
                 else:
                     print(f"  WARNING: Failed to place SELL order for {symbol}. Will retry on next run.")
-                continue # Done with this symbol for this run
+                continue
 
-            # Check for Stop Loss
             if latest_price <= stop_loss_price:
                 print(f"  SIGNAL: SELL {symbol} - Stop Loss triggered!")
                 if place_alpaca_order(alpaca_client, symbol, qty, "sell"):
                     del bot_managed_positions[symbol]
                 else:
                     print(f"  WARNING: Failed to place SELL order for {symbol}. Will retry on next run.")
-                continue # Done with this symbol for this run
+                continue
 
             print(f"  Holding {symbol}. No sell signal yet.")
 
-        # 4. Buy Logic (if we do not hold this asset and have room for more positions)
         else:
             if len(bot_managed_positions) >= MAX_POSITIONS:
                 print(f"  Skipping BUY for {symbol}: Max positions ({MAX_POSITIONS}) already open.")
                 continue
 
-            # Buy the dip conditions:
-            # a) Long-term trend is up (price above long SMA)
-            # b) Price has dipped below a recent high / short SMA (or a specific percentage)
-            # c) RSI indicates oversold
             is_uptrend = (latest_price > sma_long) if not pd.isna(sma_long) else False
-            # Define 'is_dip' more robustly. E.g., current price is significantly below recent high
             is_significant_dip = False
             if not pd.isna(recent_high) and recent_high > 0:
                 price_drop_from_high = (recent_high - latest_price) / recent_high
@@ -387,26 +352,21 @@ def run_trading_strategy():
             if is_uptrend and is_significant_dip and is_oversold_rsi:
                 print(f"  SIGNAL: BUY {symbol} - Conditions met!")
 
-                # Calculate quantity based on TRADE_AMOUNT_PER_ASSET
                 qty_to_buy_float = TRADE_AMOUNT_PER_ASSET / latest_price
 
-                # Alpaca requires specific quantity types (shares for stock, decimal for crypto)
                 if asset_type == "stock":
-                    qty_to_buy = max(1, int(qty_to_buy_float)) # Buy at least 1 share
+                    qty_to_buy = max(1, int(qty_to_buy_float))
                 elif asset_type == "crypto":
-                    qty_to_buy = round(qty_to_buy_float, 6) # Round to 6 decimal places for crypto
-                    # Alpaca crypto minimum order sizes might vary, often a small number like 0.0001 BTC
-                    # Ensure qty is above minimum or adjust TRADE_AMOUNT_PER_ASSET
-                    if qty_to_buy < 0.00001 and symbol == "BTCUSD": # Example for BTC
+                    qty_to_buy = round(qty_to_buy_float, 6)
+                    if qty_to_buy < 0.00001 and symbol == "BTCUSD":
                         print("  WARN: BTCUSD quantity too small, adjusting to minimum viable.")
                         qty_to_buy = 0.00001
-                    if qty_to_buy < 0.001 and symbol == "ETHUSD": # Example for ETH
+                    if qty_to_buy < 0.001 and symbol == "ETHUSD":
                         print("  WARN: ETHUSD quantity too small, adjusting to minimum viable.")
                         qty_to_buy = 0.001
 
                 if qty_to_buy > 0:
                     if place_alpaca_order(alpaca_client, symbol, qty_to_buy, "buy"):
-                        # If order is placed successfully, track it
                         bot_managed_positions[symbol] = {
                             'qty': qty_to_buy,
                             'entry_price': latest_price,
@@ -421,7 +381,6 @@ def run_trading_strategy():
             else:
                 print(f"  No BUY signal for {symbol}.")
 
-    # Save the updated bot state at the end of the run
     save_bot_state(bot_managed_positions)
     print("\n--- Scan and trading logic complete ---")
 
