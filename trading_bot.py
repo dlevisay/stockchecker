@@ -18,11 +18,11 @@ from ta.trend import SMAIndicator
 
 # Alpaca API imports
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest # Corrected: Removed BracketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass # Corrected: Added OrderClass
+from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 from alpaca.data.historical import CryptoHistoricalDataClient, StockHistoricalDataClient
 from alpaca.data.requests import CryptoBarsRequest, StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit # Corrected: Added TimeFrameUnit
 
 # --- Configuration ---
 # Fetch API keys from environment variables for security
@@ -49,7 +49,8 @@ TAKE_PROFIT_PERCENT = 0.03    # 3% take profit from entry price
 SCAN_INTERVAL_SECONDS = 300   # How often to scan the market (300s = 5 minutes)
 
 # --- Technical Indicator Parameters ---
-TIME_INTERVAL = TimeFrame.Minute_5 # Timeframe for data bars
+# Corrected: Use the TimeFrame constructor for specific intervals
+TIME_INTERVAL = TimeFrame(5, TimeFrameUnit.Minute)
 RSI_PERIOD = 14
 SMA_LONG_PERIOD = 200
 DIP_THRESHOLD_PERCENT = 0.015
@@ -141,19 +142,18 @@ def calculate_technical_indicators(df):
 def execute_bracket_order(symbol, trading_client):
     """Submits a bracket order for the given symbol."""
     try:
-        # For crypto, the API for latest trade is slightly different.
+        # The method for getting the latest price differs for stocks and crypto
         if "/" in symbol:
              latest_price = trading_client.get_latest_crypto_trade(symbol).price
         else:
              latest_price = trading_client.get_latest_trade(symbol).price
         
-        # *** CORRECTED LOGIC FOR BRACKET ORDER ***
         market_order_data = MarketOrderRequest(
             symbol=symbol,
             notional=TRADE_AMOUNT_PER_ASSET,
             side=OrderSide.BUY,
             time_in_force=TimeInForce.GTC,  # Good 'til Canceled
-            order_class=OrderClass.BRACKET, # Specify the order class as BRACKET
+            order_class=OrderClass.BRACKET, 
             take_profit={'limit_price': round(latest_price * (1 + TAKE_PROFIT_PERCENT), 2)},
             stop_loss={'stop_price': round(latest_price * (1 - STOP_LOSS_PERCENT), 2)}
         )
@@ -219,7 +219,7 @@ def run_trading_bot():
                 logging.info(f"  -> Price: ${latest_price:,.2f}, RSI: {rsi:.2f}, SMA_200: ${sma_long:,.2f}, Recent High: ${recent_high:,.2f}")
 
                 # --- The Buy Strategy Logic ---
-                is_uptrend = latest_price > sma_long
+                is_uptrend = latest__price > sma_long
                 is_oversold = rsi <= RSI_OVERSOLD
                 is_dip = (recent_high - latest_price) / recent_high >= DIP_THRESHOLD_PERCENT
                 
