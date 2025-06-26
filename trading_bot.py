@@ -1,7 +1,7 @@
 # --- TRADING BOT DISCLAIMER ---
 # This script is for educational and experimental purposes only.
-# It is designed to be run by a scheduler (like cron or GitHub Actions) and will exit after one scan.
-# The parameters have been updated based on a historical backtest optimization.
+# It now includes a dynamic screener to find new trading opportunities daily.
+# It is designed to be run once per day after market close.
 
 import os
 import time
@@ -15,41 +15,34 @@ from ta.trend import SMAIndicator
 
 # Alpaca API imports
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
-from alpaca.data.historical import CryptoHistoricalDataClient, StockHistoricalDataClient
-from alpaca.data.requests import CryptoBarsRequest, StockBarsRequest
+from alpaca.trading.requests import MarketOrderRequest, GetAssetsRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, AssetClass, AssetStatus
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+from alpaca.data.snapshot import StockSnapshot
 
 # --- Configuration ---
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 PAPER_TRADING_MODE = os.getenv("PAPER_TRADING_MODE", "True").lower() == "true"
 
-SYMBOLS_TO_SCAN = {
-    "AAPL": "stock",
-    "MSFT": "stock",
-    "GOOGL": "stock",
-    "BTC/USD": "crypto",
-    "ETH/USD": "crypto"
-}
+# --- REVISED Screener & Strategy Parameters ---
+MAX_SYMBOLS_TO_ANALYZE = 100 # Analyze the top 100 most liquid stocks that pass the screener
+MIN_SHARE_PRICE = 20.0
+MIN_AVG_DOLLAR_VOLUME = 20_000_000 # 20 Million
 
-# --- OPTIMIZED Strategy & Risk Management Parameters ---
-# These values were determined through backtesting to maximize risk-adjusted returns.
-TRADE_AMOUNT_PER_ASSET = 100
 MAX_POSITIONS = 5
-STOP_LOSS_PERCENT = 0.04      # UPDATED from 0.02 - Wider stop to allow more room for trades.
-TAKE_PROFIT_PERCENT = 0.08    # UPDATED from 0.03 - Higher target to capture larger gains.
+ACCOUNT_RISK_PERCENT = 0.01
+STOP_LOSS_PERCENT = 0.04
+TAKE_PROFIT_PERCENT = 0.08
 
-# --- OPTIMIZED Technical Indicator Parameters ---
-# WARNING: These were optimized on DAILY data. Performance on intraday data is unverified.
-TIME_INTERVAL = TimeFrame(5, TimeFrameUnit.Minute) # Kept as original, but see warning above.
+TIME_INTERVAL = TimeFrame(1, TimeFrameUnit.Day)
 RSI_PERIOD = 14
 SMA_LONG_PERIOD = 200
-DIP_THRESHOLD_PERCENT = 0.01  # UPDATED from 0.015 - More sensitive to smaller dips.
-RSI_OVERSOLD = 35             # UPDATED from 30 - Enters trades sooner, increasing frequency.
-DIP_ROLLING_PERIOD = 20       # Explicitly defined for clarity in calculating recent high.
-
+DIP_THRESHOLD_PERCENT = 0.02
+RSI_OVERSOLD = 35
+DIP_ROLLING_PERIOD = 20
 
 # --- Setup Logging ---
 logging.basicConfig(
@@ -58,49 +51,83 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
-# --- Initialization ---
 def initialize_clients():
+    # Initializes and returns the trading and data clients
     if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
-        logging.error("CRITICAL: Alpaca API keys not found in environment variables.")
-        return None, None, None
+        logging.error("CRITICAL: Alpaca API keys not found.")
+        return None, None
     try:
         trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=PAPER_TRADING_MODE)
-        account = trading_client.get_account()
-        logging.info(f"Trading client initialized. Account Status: {account.status}")
-        logging.info(f"Buying Power: ${float(account.buying_power):,.2f}")
-        stock_data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
-        crypto_data_client = CryptoHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
-        logging.info("Historical data clients initialized.")
-        return trading_client, stock_data_client, crypto_data_client
+        data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+        logging.info("Trading and Data clients initialized.")
+        return trading_client, data_client
     except Exception as e:
         logging.error(f"Error initializing Alpaca clients: {e}")
-        return None, None, None
+        return None, None
 
-# --- Data Fetching ---
-def get_historical_data(symbol, asset_type, stock_client, crypto_client):
-    try:
-        # Fetch enough data for the 200-period SMA on the specified timeframe
-        start_time = datetime.now() - timedelta(days=20) # Increased lookback for safety
-        if asset_type == "stock":
-            request_params = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TIME_INTERVAL, start=start_time)
-            bars = stock_client.get_stock_bars(request_params).df
-        elif asset_type == "crypto":
-            request_params = CryptoBarsRequest(symbol_or_symbols=symbol, timeframe=TIME_INTERVAL, start=start_time)
-            bars = crypto_client.get_crypto_bars(request_params).df
-        else:
-            return None
+# --- NEW SCREENER FUNCTION ---
+def get_screened_symbols(trading_client, data_client):
+    """
+    Scans the market for high-quality, liquid stocks to trade.
+    """
+    logging.info("--- Starting Market Scan/Screening Process ---")
+    
+    # 1. Get all US Equity assets from Alpaca
+    search_params = GetAssetsRequest(asset_class=AssetClass.US_EQUITY, status=AssetStatus.ACTIVE)
+    assets = trading_client.get_assets(search_params)
+    tradable_assets = [asset for asset in assets if asset.tradable and asset.shortable and asset.easy_to_borrow]
+    logging.info(f"Found {len(tradable_assets)} tradable US equity assets.")
+
+    # 2. Filter assets based on liquidity and price
+    qualified_symbols = []
+    chunk_size = 200 # Process symbols in chunks to avoid overwhelming the API
+    for i in range(0, len(tradable_assets), chunk_size):
+        asset_chunk = tradable_assets[i:i + chunk_size]
+        symbols_chunk = [asset.symbol for asset in asset_chunk]
         
+        try:
+            # Fetch snapshots for volume and price data
+            snapshots = data_client.get_stock_snapshots(symbols_chunk)
+            
+            for symbol, snapshot in snapshots.items():
+                if snapshot and snapshot.daily_bar and snapshot.latest_trade:
+                    avg_dollar_volume = snapshot.daily_bar.volume * snapshot.daily_bar.close
+                    if (avg_dollar_volume > MIN_AVG_DOLLAR_VOLUME and
+                        snapshot.latest_trade.price > MIN_SHARE_PRICE):
+                        qualified_symbols.append({
+                            "symbol": symbol,
+                            "dollar_volume": avg_dollar_volume
+                        })
+        except Exception as e:
+            logging.warning(f"Could not process chunk {i // chunk_size + 1}: {e}")
+        time.sleep(1) # Pause between chunks to respect rate limits
+
+    # 3. Sort by dollar volume and return the top symbols
+    qualified_symbols.sort(key=lambda x: x['dollar_volume'], reverse=True)
+    
+    final_symbols = [d['symbol'] for d in qualified_symbols[:MAX_SYMBOLS_TO_ANALYZE]]
+    
+    logging.info(f"Screening complete. Found {len(qualified_symbols)} qualified stocks.")
+    logging.info(f"Analyzing top {len(final_symbols)} most liquid symbols: {final_symbols[:10]}...")
+    
+    return final_symbols
+
+# --- The rest of the functions (calculate_technical_indicators, etc.) remain the same ---
+# ... (insert the unchanged functions from the previous version here) ...
+def get_historical_data(symbol, data_client):
+    try:
+        start_time = datetime.now() - timedelta(days=365) # Fetch enough data for 200-day SMA
+        request_params = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TIME_INTERVAL, start=start_time)
+        bars = data_client.get_stock_bars(request_params).df
         if isinstance(bars.index, pd.MultiIndex):
             bars = bars.loc[symbol]
         if bars.empty or len(bars) < SMA_LONG_PERIOD:
-            logging.warning(f"Not enough historical data for {symbol} (needed {SMA_LONG_PERIOD}, got {len(bars)}).")
             return None
         return bars
     except Exception as e:
         logging.error(f"Error fetching historical data for {symbol}: {e}")
         return None
 
-# --- Indicator Calculation ---
 def calculate_technical_indicators(df):
     if df is None or df.empty: return None, None, None
     close_prices = df['close'].squeeze()
@@ -109,67 +136,75 @@ def calculate_technical_indicators(df):
     recent_high = df['high'].rolling(window=DIP_ROLLING_PERIOD, min_periods=1).max().iloc[-1]
     return rsi, sma_long, recent_high
 
-# --- Trading Logic ---
-def execute_bracket_order(symbol, trading_client):
+def execute_bracket_order(symbol, trade_amount, trading_client):
     try:
-        if "/" in symbol:
-             latest_price = trading_client.get_latest_crypto_trade(symbol).price
-        else:
-             latest_price = trading_client.get_latest_trade(symbol).price
-        
+        latest_price = trading_client.get_latest_trade(symbol).price
         market_order_data = MarketOrderRequest(
             symbol=symbol,
-            notional=TRADE_AMOUNT_PER_ASSET,
+            notional=trade_amount,
             side=OrderSide.BUY,
             time_in_force=TimeInForce.GTC,
-            order_class=OrderClass.BRACKET, 
+            order_class=OrderClass.BRACKET,
             take_profit={'limit_price': round(latest_price * (1 + TAKE_PROFIT_PERCENT), 2)},
             stop_loss={'stop_price': round(latest_price * (1 - STOP_LOSS_PERCENT), 2)}
         )
         order = trading_client.submit_order(order_data=market_order_data)
-        logging.info(f"SUCCESS: Submitted bracket order for {symbol}. Order ID: {order.id}")
+        logging.info(f"SUCCESS: Submitted bracket order for {symbol} for ${trade_amount:,.2f}. Order ID: {order.id}")
     except Exception as e:
         logging.error(f"Failed to submit bracket order for {symbol}: {e}")
 
 # --- Main Bot Function ---
 def run_trading_scan():
-    """Main function to run a single trading scan."""
-    trading_client, stock_data_client, crypto_data_client = initialize_clients()
-    if not all([trading_client, stock_data_client, crypto_data_client]):
+    """Main function to screen the market and run a single daily trading scan."""
+    trading_client, data_client = initialize_clients()
+    if not all([trading_client, data_client]):
         return # Exit if clients failed to initialize
 
-    logging.info("--- Starting new scan cycle with OPTIMIZED parameters ---")
+    # --- DYNAMICALLY GET SYMBOLS TO SCAN ---
+    symbols_to_scan = get_screened_symbols(trading_client, data_client)
+    if not symbols_to_scan:
+        logging.warning("Screener returned no symbols. Exiting scan.")
+        return
+
+    logging.info("--- Starting Technical Analysis on Screened Stocks ---")
     account = trading_client.get_account()
     positions = trading_client.get_all_positions()
     held_symbols = {p.symbol for p in positions}
+    account_equity = float(account.equity)
+
+    logging.info(f"Account Equity: ${account_equity:,.2f}.")
     logging.info(f"Currently holding {len(held_symbols)} positions: {list(held_symbols)}")
 
     if len(held_symbols) >= MAX_POSITIONS:
         logging.warning(f"Max positions ({MAX_POSITIONS}) reached. Exiting scan.")
         return
 
-    if float(account.buying_power) < TRADE_AMOUNT_PER_ASSET:
-        logging.warning("Insufficient buying power to place a new trade. Exiting scan.")
+    # --- DYNAMIC RISK MANAGEMENT ---
+    max_risk_per_trade = account_equity * ACCOUNT_RISK_PERCENT
+    trade_amount_per_asset = max_risk_per_trade / STOP_LOSS_PERCENT
+    logging.info(f"Risk config: Max risk/trade: ${max_risk_per_trade:,.2f}. Position Size: ${trade_amount_per_asset:,.2f}")
+
+    if float(account.buying_power) < trade_amount_per_asset:
+        logging.warning(f"Insufficient buying power for new trade. Exiting.")
         return
 
-    for symbol, asset_type in SYMBOLS_TO_SCAN.items():
+    for symbol in symbols_to_scan:
         if symbol in held_symbols:
-            logging.info(f"Already hold a position in {symbol}, skipping scan.")
             continue
         
-        logging.info(f"Processing {symbol} ({asset_type})...")
-        df_data = get_historical_data(symbol, asset_type, stock_data_client, crypto_data_client)
+        logging.info(f"Processing {symbol}...")
+        df_data = get_historical_data(symbol, data_client)
         if df_data is None: continue
 
         latest_price = df_data['close'].iloc[-1]
         rsi, sma_long, recent_high = calculate_technical_indicators(df_data)
-        if pd.isna(rsi) or pd.isna(sma_long) or pd.isna(recent_high):
+        if any(pd.isna(x) for x in [rsi, sma_long, recent_high]):
             logging.warning(f"Could not calculate all indicators for {symbol}. Skipping.")
             continue
         
-        logging.info(f"  -> Price: ${latest_price:,.2f}, RSI: {rsi:.2f}, SMA_200: ${sma_long:,.2f}, Recent High: ${recent_high:,.2f}")
-
-        is_uptrend = latest_price > sma_long 
+        logging.info(f"  -> Price: ${latest_price:,.2f}, RSI: {rsi:.2f}, SMA_200: ${sma_long:,.2f}")
+        
+        is_uptrend = latest_price > sma_long
         is_oversold = rsi <= RSI_OVERSOLD
         is_dip = (recent_high - latest_price) / recent_high >= DIP_THRESHOLD_PERCENT
         
@@ -177,10 +212,10 @@ def run_trading_scan():
 
         if is_uptrend and is_oversold and is_dip:
             logging.info(f"**** BUY SIGNAL DETECTED FOR {symbol} ****")
-            execute_bracket_order(symbol, trading_client)
-            logging.info("Trade placed. Ending this scan cycle to allow positions to update.")
-            break 
-    
+            execute_bracket_order(symbol, trade_amount_per_asset, trading_client)
+            logging.info("Trade placed. Ending this scan cycle.")
+            return # Use return to exit after one trade, break would just exit the loop
+            
     logging.info("--- Scan complete ---")
 
 if __name__ == "__main__":
