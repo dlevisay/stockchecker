@@ -18,8 +18,8 @@ from ta.trend import SMAIndicator
 
 # Alpaca API imports
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import BracketOrderRequest, MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.requests import MarketOrderRequest # Corrected: Removed BracketOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass # Corrected: Added OrderClass
 from alpaca.data.historical import CryptoHistoricalDataClient, StockHistoricalDataClient
 from alpaca.data.requests import CryptoBarsRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
@@ -141,22 +141,28 @@ def calculate_technical_indicators(df):
 def execute_bracket_order(symbol, trading_client):
     """Submits a bracket order for the given symbol."""
     try:
-        latest_price = trading_client.get_latest_trade(symbol).price
+        # For crypto, the API for latest trade is slightly different.
+        if "/" in symbol:
+             latest_price = trading_client.get_latest_crypto_trade(symbol).price
+        else:
+             latest_price = trading_client.get_latest_trade(symbol).price
         
-        bracket_order_data = BracketOrderRequest(
+        # *** CORRECTED LOGIC FOR BRACKET ORDER ***
+        market_order_data = MarketOrderRequest(
             symbol=symbol,
             notional=TRADE_AMOUNT_PER_ASSET,
             side=OrderSide.BUY,
             time_in_force=TimeInForce.GTC,  # Good 'til Canceled
+            order_class=OrderClass.BRACKET, # Specify the order class as BRACKET
             take_profit={'limit_price': round(latest_price * (1 + TAKE_PROFIT_PERCENT), 2)},
             stop_loss={'stop_price': round(latest_price * (1 - STOP_LOSS_PERCENT), 2)}
         )
         
-        order = trading_client.submit_order(order_data=bracket_order_data)
+        order = trading_client.submit_order(order_data=market_order_data)
         logging.info(f"SUCCESS: Submitted bracket order for {symbol}. Order ID: {order.id}")
         logging.info(f"  - Entry Price (approx): ${latest_price:,.2f}")
-        logging.info(f"  - Take Profit Price: ${bracket_order_data.take_profit['limit_price']:,.2f}")
-        logging.info(f"  - Stop Loss Price: ${bracket_order_data.stop_loss['stop_price']:,.2f}")
+        logging.info(f"  - Take Profit Price: ${market_order_data.take_profit['limit_price']:,.2f}")
+        logging.info(f"  - Stop Loss Price: ${market_order_data.stop_loss['stop_price']:,.2f}")
         
     except Exception as e:
         logging.error(f"Failed to submit bracket order for {symbol}: {e}")
