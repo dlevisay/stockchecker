@@ -28,14 +28,12 @@ MIN_SHARE_PRICE = 20.0
 MIN_AVG_DOLLAR_VOLUME = 20_000_000 # 20 Million
 
 MAX_POSITIONS = 5
-# MODIFIED: Risk management is now more nuanced
-ACCOUNT_RISK_PERCENT = 0.01 # The max % of total equity to risk on a single trade
-MAX_POSITION_SIZE_PERCENT = 0.10 # NEW: The max % of total equity to allocate to a single position (e.g., 0.10 for 10%)
+ACCOUNT_RISK_PERCENT = 0.01
+MAX_POSITION_SIZE_PERCENT = 0.10
 
-# MODIFIED: Removed static percentages, using ATR multiples instead
 ATR_PERIOD = 14
-ATR_STOP_MULTIPLE = 2.0 # e.g., Stop loss will be 2 * ATR below entry
-ATR_TAKE_PROFIT_MULTIPLE = 4.0 # e.g., Take profit will be 4 * ATR above entry
+ATR_STOP_MULTIPLE = 2.0
+ATR_TAKE_PROFIT_MULTIPLE = 4.0
 
 TIME_INTERVAL = TimeFrame(1, TimeFrameUnit.Day)
 RSI_PERIOD = 14
@@ -44,9 +42,8 @@ DIP_THRESHOLD_PERCENT = 0.02
 RSI_OVERSOLD = 35
 DIP_ROLLING_PERIOD = 20
 
-# NEW: Parameters for the market-wide regime filter
 MARKET_INDEX_SYMBOL = 'SPY'
-MARKET_REGIME_SMA_PERIOD = 50 # Use the 50-day SMA for the market regime filter
+MARKET_REGIME_SMA_PERIOD = 50
 
 # --- Setup Logging ---
 logging.basicConfig(
@@ -62,7 +59,8 @@ def initialize_clients():
         return None, None
     try:
         trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=PAPER_TRADING_MODE)
-        data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+        # FINAL FIX: Added feed='iex' to use the free data feed for historical data.
+        data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, feed='iex')
         logging.info("Trading and Data clients initialized.")
         return trading_client, data_client
     except Exception as e:
@@ -130,7 +128,6 @@ def get_historical_data(symbol, data_client, days=365):
         logging.error(f"Error fetching historical data for {symbol}: {e}")
         return None
 
-# MODIFIED: This function now also calculates and returns ATR
 def calculate_technical_indicators(df):
     """
     Calculates technical indicators manually using pandas.
@@ -154,7 +151,6 @@ def calculate_technical_indicators(df):
 
     recent_high = df['high'].rolling(window=DIP_ROLLING_PERIOD, min_periods=1).max().iloc[-1]
 
-    # NEW: Calculate ATR (Average True Range)
     high_low = df['high'] - df['low']
     high_close = (df['high'] - df['close'].shift()).abs()
     low_close = (df['low'] - df['close'].shift()).abs()
@@ -163,7 +159,6 @@ def calculate_technical_indicators(df):
 
     return rsi, sma_long, recent_high, atr
 
-# MODIFIED: Signature changed to accept pre-calculated stop/take profit prices
 def execute_bracket_order(symbol, trade_amount, take_profit_price, stop_loss_price, trading_client):
     """Submits a bracket order with a notional trade amount and precise exit prices."""
     try:
@@ -182,17 +177,15 @@ def execute_bracket_order(symbol, trade_amount, take_profit_price, stop_loss_pri
     except Exception as e:
         logging.error(f"Failed to submit bracket order for {symbol}: {e}")
 
-# MODIFIED: Entire main function refactored for new logic
 def run_trading_scan():
     """Main function to screen, rank, and trade based on the enhanced strategy."""
     trading_client, data_client = initialize_clients()
     if not all([trading_client, data_client]): return
 
-    # --- 1. NEW: Market Regime Filter ---
+    # --- 1. Market Regime Filter ---
     logging.info(f"--- Checking Market-Wide Regime via {MARKET_INDEX_SYMBOL} ---")
     spy_data = get_historical_data(MARKET_INDEX_SYMBOL, data_client, days=100)
     if spy_data is None:
-        logging.error(f"Could not fetch data for market index {MARKET_INDEX_SYMBOL}. Aborting scan.")
         return
     
     spy_sma = spy_data['close'].rolling(window=MARKET_REGIME_SMA_PERIOD).mean().iloc[-1]
@@ -222,7 +215,7 @@ def run_trading_scan():
         logging.warning("Screener returned no symbols. Exiting scan.")
         return
 
-    # --- 3. NEW: Analyze All Symbols and Collect Valid Signals ---
+    # --- 3. Analyze All Symbols and Collect Valid Signals ---
     logging.info("--- Starting Technical Analysis on Screened Stocks ---")
     buy_signals = []
     for symbol in symbols_to_scan:
@@ -253,32 +246,28 @@ def run_trading_scan():
             })
             logging.info(f"  -> VALID BUY SIGNAL FOUND for {symbol}. Added to candidate list.")
             
-    # --- 4. NEW: Rank Signals and Select the Best One ---
+    # --- 4. Rank Signals and Select the Best One ---
     if not buy_signals:
         logging.info("--- Scan complete. No valid buy signals found today. ---")
         return
         
-    # Rank by the lowest RSI to find the most 'oversold' candidate
     buy_signals.sort(key=lambda x: x['rsi'])
     best_signal = buy_signals[0]
     
     logging.info(f"--- Found {len(buy_signals)} signal(s). Best candidate is {best_signal['symbol']} with RSI {best_signal['rsi']:.2f} ---")
 
-    # --- 5. NEW: Refined Position Sizing ---
+    # --- 5. Refined Position Sizing ---
     symbol_to_buy = best_signal['symbol']
     latest_price = best_signal['price']
     atr = best_signal['atr']
     
     stop_loss_per_share = atr * ATR_STOP_MULTIPLE
     
-    # 1. Calculate size based on account risk %
     max_risk_per_trade_dollar = account_equity * ACCOUNT_RISK_PERCENT
     risk_based_notional_size = (max_risk_per_trade_dollar / stop_loss_per_share) * latest_price
     
-    # 2. Calculate size based on max allocation cap %
     max_notional_by_cap = account_equity * MAX_POSITION_SIZE_PERCENT
     
-    # 3. Final position size is the smaller of the two calculations
     final_trade_amount = min(risk_based_notional_size, max_notional_by_cap)
     
     logging.info(f"--- Dynamic Position Sizing for {symbol_to_buy} ---")
