@@ -16,7 +16,6 @@ from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, AssetClass,
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
-from alpaca.data.snapshot import StockSnapshot
 
 # --- Configuration ---
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
