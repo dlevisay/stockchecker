@@ -59,8 +59,8 @@ def initialize_clients():
         return None, None
     try:
         trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=PAPER_TRADING_MODE)
-        # FINAL FIX: Added feed='iex' to use the free data feed for historical data.
-        data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, feed='iex')
+        # CORRECTED: The 'feed' parameter is removed from the client initialization.
+        data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
         logging.info("Trading and Data clients initialized.")
         return trading_client, data_client
     except Exception as e:
@@ -88,7 +88,8 @@ def get_screened_symbols(trading_client, data_client):
         symbols_chunk = [asset.symbol for asset in asset_chunk]
         
         try:
-            request_params = StockLatestBarRequest(symbol_or_symbols=symbols_chunk)
+            # CORRECTED: Added feed='iex' to the data request.
+            request_params = StockLatestBarRequest(symbol_or_symbols=symbols_chunk, feed='iex')
             latest_bars = data_client.get_stock_latest_bar(request_params)
             
             for symbol, bar in latest_bars.items():
@@ -116,7 +117,8 @@ def get_historical_data(symbol, data_client, days=365):
     """Fetches historical daily bar data for a given symbol."""
     try:
         start_time = datetime.now() - timedelta(days=days)
-        request_params = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TIME_INTERVAL, start=start_time)
+        # CORRECTED: Added feed='iex' to the data request.
+        request_params = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TIME_INTERVAL, start=start_time, feed='iex')
         bars = data_client.get_stock_bars(request_params).df
         if isinstance(bars.index, pd.MultiIndex):
             bars = bars.loc[symbol]
